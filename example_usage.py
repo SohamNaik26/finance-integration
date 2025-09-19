@@ -27,7 +27,9 @@ from main_integration import (
     fetch_mayan_quotes,
     fetch_tron_balances_simple,
     fetch_tron_accounts_alternative,
-    fetch_tronscan_balances
+    fetch_tronscan_balances,
+    EverclearBalanceParams,
+    fetch_everclear_balance_history
 )
 
 
@@ -338,6 +340,27 @@ async def run_examples():
     alt_tron_df = await example_alternative_tron()
     tronscan_df = await example_tronscan()
     
+    # Everclear example (ETH balance history) - disabled CSV by default to keep 2-file behavior
+    print("\n🔍 Fetching Everclear Balance History...")
+    everclear_params = [
+        EverclearBalanceParams(
+            address="0xEFfAB7cCEBF63FbEFB4884964b12259d4374FaAa",
+            items_count=50,
+            page=1
+        )
+    ]
+    try:
+        everclear_df = await fetch_everclear_balance_history(everclear_params, save_to_csv=False)
+        print(f"   ✓ Fetched {len(everclear_df)} balance history records")
+        if len(everclear_df.columns) > 0:
+            print(f"   ✓ Columns: {len(everclear_df.columns)} fields")
+        if len(everclear_df) > 0:
+            print(f"   ✓ Sample address: {everclear_df['address'].iloc[0][:6]}...")
+            if 'balance_eth' in everclear_df.columns:
+                print(f"   ✓ Balance: {everclear_df['balance_eth'].iloc[0]} ETH")
+    except Exception as e:
+        print(f"   ✗ Error fetching Everclear data: {e}")
+    
     print("\n=== Integration Complete ===")
     print("✅ Mayan Bridge: Works without API key")
     print("✅ Simple TRON Integration: Works without API key")
@@ -352,6 +375,11 @@ async def run_examples():
     print(f"   - TRON balances (simple): {len(simple_tron_df)}")
     print(f"   - TRON accounts (alt): {len(alt_tron_df)}")
     print(f"   - TronScan data: {len(tronscan_df)}")
+    # Everclear not saved to CSV by default, just display count if fetched
+    try:
+        print(f"   - Everclear balance history: {len(everclear_df)}")
+    except Exception:
+        pass
     
     print("\nCheck the generated CSV files for detailed data.")
     print("\n🎉 SUCCESS: Your finance integration is working!")

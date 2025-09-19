@@ -174,6 +174,44 @@ class TronBalanceResponse(BaseModel):
 
 
 # ============================================================================
+# EVERCLEAR BALANCE HISTORY MODELS
+# ============================================================================
+
+class EverclearBalanceParams(BaseModel):
+    """Input parameters for Everclear balance history requests (ETH only)."""
+    model_config = ConfigDict(extra='allow')
+
+    address: str
+    block_number: Optional[int] = None
+    items_count: int = 50  # 1-100
+    page: int = 1  # 1-based
+
+    def is_valid_eth_address(self) -> bool:
+        return isinstance(self.address, str) and self.address.startswith("0x") and len(self.address) == 42
+
+
+class EverclearBalanceRecord(BaseModel):
+    """Flattened record for Everclear ETH balance history."""
+    model_config = ConfigDict(extra='allow')
+
+    address: str
+    block_number: int
+    block_hash: str = ""
+    transaction_hash: Optional[str] = None
+    balance_wei: str = "0"
+    balance_eth: float = 0.0
+    balance_change_wei: str = "0"
+    balance_change_eth: float = 0.0
+    timestamp: str = ""
+    timestamp_iso: str = ""
+    fetch_timestamp: str = ""
+    source_api: str = "everclear_scan"
+    page: int = 1
+    error: Optional[str] = None
+    error_type: Optional[str] = None
+
+
+# ============================================================================
 # MAYAN BRIDGE INTEGRATION
 # ============================================================================
 
@@ -759,6 +797,155 @@ class TronscanBalanceIntegration:
                 all_records.append(error_record)
         
         return pd.DataFrame(all_records)
+
+
+# ============================================================================
+# EVERCLEAR BALANCE HISTORY INTEGRATION
+# ============================================================================
+
+class EverclearIntegration:
+    """Integration for Everclear scan API (ETH balance history)."""
+
+    BASE_URL = "https://scan.everclear.org/api/v2/addresses/{address}/coin-balance-history"
+
+    def __init__(self, timeout: int = 30) -> None:
+        self.timeout = timeout
+        self.client: Optional[httpx.AsyncClient] = None
+
+    async def __aenter__(self) -> "EverclearIntegration":
+        self.client = httpx.AsyncClient(timeout=self.timeout)
+        return self
+
+    async def __aexit__(self, *args: Any) -> None:
+        if self.client:
+            await self.client.aclose()
+
+    def _build_url(self, params: EverclearBalanceParams) -> str:
+        query_params: Dict[str, Any] = {}
+        if params.block_number is not None:
+            query_params["block_number"] = params.block_number
+        query_params["items_count"] = max(1, min(100, int(params.items_count)))
+        query_params["page"] = max(1, int(params.page))
+        qs = urlencode(query_params)
+        return f"{self.BASE_URL.format(address=params.address)}?{qs}" if qs else self.BASE_URL.format(address=params.address)
+
+    def _flatten_item(self, item: Dict[str, Any], params: EverclearBalanceParams) -> EverclearBalanceRecord:
+        # API returns wei strings; convert to ETH
+        balance_wei = str(item.get("balance", "0"))
+        change_wei = str(item.get("balance_change", "0"))
+        try:
+            balance_eth = float(int(balance_wei)) / 1e18
+        except Exception:
+            balance_eth = 0.0
+        try:
+            balance_change_eth = float(int(change_wei)) / 1e18
+        except Exception:
+            balance_change_eth = 0.0
+
+        ts = item.get("timestamp")
+        ts_iso = ""
+        if isinstance(ts, (int, float)):
+            try:
+                ts_iso = datetime.fromtimestamp(float(ts), tz=timezone.utc).isoformat()
+            except Exception:
+                ts_iso = ""
+
+        return EverclearBalanceRecord(
+            address=params.address,
+            block_number=int(item.get("block_number", 0) or 0),
+            block_hash=str(item.get("block_hash", "")),
+            transaction_hash=item.get("transaction_hash"),
+            balance_wei=balance_wei,
+            balance_eth=balance_eth,
+            balance_change_wei=change_wei,
+            balance_change_eth=balance_change_eth,
+            timestamp=str(ts),
+            timestamp_iso=ts_iso,
+            fetch_timestamp=datetime.now(timezone.utc).isoformat(),
+            source_api="everclear_scan",
+            page=params.page,
+        )
+
+    async def fetch_page(self, params: EverclearBalanceParams) -> List[Dict[str, Any]]:
+        if not self.client:
+            raise RuntimeError("Client not initialized. Use async context manager.")
+        url = self._build_url(params)
+        response = await self.client.get(url)
+        response.raise_for_status()
+        data = response.json()
+        # Expecting { items: [...] } per everclear docs
+        items = data.get("items") if isinstance(data, dict) else None
+        if not isinstance(items, list):
+            return []
+        return [self._flatten_item(it, params).model_dump() for it in items]
+
+
+async def fetch_everclear_balance_history(params_list: List[EverclearBalanceParams], max_concurrent: int = 5, save_to_csv: bool = False, csv_mode: str = 'create') -> pd.DataFrame:
+    """Fetch Everclear ETH balance history for provided addresses/pages.
+
+    - Focuses on ETH balances; converts wei -> ETH
+    - Supports pagination via items_count and page
+    - Does not save CSV by default to preserve two-file behavior
+    """
+    semaphore = asyncio.Semaphore(max(1, int(max_concurrent)))
+    results: List[Dict[str, Any]] = []
+
+    async with EverclearIntegration() as integration:
+        async def run_one(p: EverclearBalanceParams) -> None:
+            if not p.is_valid_eth_address():
+                results.append(EverclearBalanceRecord(
+                    address=p.address,
+                    block_number=p.block_number or 0,
+                    error="invalid_eth_address",
+                    error_type="validation",
+                    fetch_timestamp=datetime.now(timezone.utc).isoformat(),
+                    page=p.page,
+                ).model_dump())
+                return
+            async with semaphore:
+                try:
+                    page_records = await integration.fetch_page(p)
+                    if page_records:
+                        results.extend(page_records)
+                except httpx.HTTPStatusError as e:
+                    results.append({
+                        "address": p.address,
+                        "block_number": p.block_number or 0,
+                        "error": f"HTTP {e.response.status_code}: {str(e)}",
+                        "error_type": "http_error",
+                        "fetch_timestamp": datetime.now(timezone.utc).isoformat(),
+                        "source_api": "everclear_scan",
+                        "page": p.page,
+                    })
+                except Exception as e:
+                    results.append({
+                        "address": p.address,
+                        "block_number": p.block_number or 0,
+                        "error": str(e),
+                        "error_type": "general_error",
+                        "fetch_timestamp": datetime.now(timezone.utc).isoformat(),
+                        "source_api": "everclear_scan",
+                        "page": p.page,
+                    })
+
+        await asyncio.gather(*(run_one(p) for p in params_list))
+
+    df = pd.DataFrame(results)
+
+    # Coerce/format
+    if 'timestamp_iso' in df.columns:
+        df['timestamp_iso'] = pd.to_datetime(df['timestamp_iso'], errors='coerce')
+    for col in ['balance_eth', 'balance_change_eth']:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+    if 'block_number' in df.columns:
+        df['block_number'] = pd.to_numeric(df['block_number'], errors='coerce')
+
+    # Save to CSV if requested (opt-in)
+    if save_to_csv and not df.empty:
+        save_csv_with_append(df, "everclear_balance_history.csv", csv_mode)
+
+    return df
 
 
 # ============================================================================
